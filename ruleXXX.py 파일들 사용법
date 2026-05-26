@@ -1,0 +1,4 @@
+"ruleXXX 사용법"
+
+라인 40번쨰 부근에 "cells" 리스트 수정하여 초기 조건 설정
+마지막 라인의 size, generations를 수정하여 관찰 가능
