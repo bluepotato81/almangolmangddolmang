@@ -1,0 +1,481 @@
+"""
+Organism Life — GoL + Meta Layer
+─────────────────────────────────
+GoL 격자 위에서 살아가는 생명체 시뮬레이터.
+
+생명체(Glider)는:
+  - GoL 규칙에 따라 격자 위를 이동
+  - 이동 경로에서 자원(Resource)을 흡수 → 에너지 증가
+  - 에너지 임계값 도달 시 자가복제 (새 Glider 생성)
+  - 에너지 고갈 시 사망
+
+조작:
+  SPACE       실행 / 일시정지
+  S           한 세대 진행
+  R           재시작
+  +/-         속도 조절
+  마우스 클릭  자원 추가
+  ESC         종료
+"""
+
+import sys, math, random, colorsys
+import pygame
+import numpy as np
+
+# ── 상수 ─────────────────────────────────────────────────────────────────────
+W, H       = 1100, 720
+CELL       = 7          # px/cell
+COLS       = W  // CELL
+ROWS       = H  // CELL
+FPS        = 60
+
+# 색
+C_BG          = (4,   8,  18)
+C_GRID        = (10, 16,  30)
+C_RESOURCE    = (30, 220, 160)    # 자원 기본색
+C_DEAD        = (20,  40,  60)    # GoL 죽은 셀
+C_HUD_TEXT    = (140, 200, 180)
+C_HUD_DIM     = (60,  90,  80)
+
+# 생명체 에너지 색 (low → high)
+ENERGY_COLORS = [
+    (30,  80, 220),   # 0% — 파랑 (위험)
+    (0,  180, 255),   # 33%
+    (0,  240, 160),   # 66%
+    (160, 255, 60),   # 100% — 노랑초록 (풍요)
+]
+
+# 생명체 파라미터
+ENERGY_START     = 12
+ENERGY_MAX       = 24
+ENERGY_PER_FOOD  = 4        # 자원 하나당 에너지
+ENERGY_DECAY     = 1        # 세대당 소모
+REPLICATE_AT     = 18       # 복제 임계값
+MAX_ORGANISMS    = 14
+
+# 자원 파라미터
+RESOURCE_DENSITY = 0.030    # 초기 자원 밀도
+RESOURCE_REGEN   = 0.00055  # 매 세대 랜덤 생성 확률 (생명체 소비 속도에 맞게 낮춤)
+
+# ── Glider 패턴 ────────────────────────────────────────────────────────────
+# 4가지 방향의 Glider (dy, dx 오프셋 목록)
+GLIDERS = {
+    'SE': [(0,1),(1,2),(2,0),(2,1),(2,2)],  # 남동
+    'SW': [(0,1),(1,0),(2,1),(2,2),(2,3)],  # 남서 (미러)
+    'NE': [(0,0),(0,1),(0,2),(1,2),(2,1)],  # 북동
+    'NW': [(0,0),(0,1),(0,2),(1,0),(2,1)],  # 북서
+}
+GLIDER_DIRS = list(GLIDERS.keys())
+
+def place_pattern(grid, r, c, pattern):
+    """패턴을 격자에 배치. 범위 초과 시 wrapping."""
+    for dr, dc in pattern:
+        rr = (r + dr) % ROWS
+        cc = (c + dc) % COLS
+        grid[rr, cc] = 1
+
+def clear_pattern(grid, r, c, radius=5):
+    """생명체 영역 강제 클리어 (죽음)"""
+    for dr in range(-radius, radius+1):
+        for dc in range(-radius, radius+1):
+            grid[(r+dr) % ROWS, (c+dc) % COLS] = 0
+
+def bounding_box_center(grid, r, c, radius=6):
+    """주변 alive 셀들의 무게중심 반환"""
+    ys, xs = [], []
+    for dr in range(-radius, radius+1):
+        for dc in range(-radius, radius+1):
+            rr = (r+dr) % ROWS
+            cc = (c+dc) % COLS
+            if grid[rr, cc]:
+                ys.append(rr); xs.append(cc)
+    if not ys:
+        return r, c
+    return int(np.mean(ys)), int(np.mean(xs))
+
+# ── Organism 클래스 ────────────────────────────────────────────────────────
+class Organism:
+    _id_counter = 0
+
+    def __init__(self, r, c, direction=None, energy=None, generation=0):
+        Organism._id_counter += 1
+        self.oid       = Organism._id_counter
+        self.r         = float(r)
+        self.c         = float(c)
+        self.direction = direction or random.choice(GLIDER_DIRS)
+        self.energy    = energy if energy is not None else ENERGY_START
+        self.generation = generation
+        self.age       = 0
+        self.alive     = True
+        self.flash     = 0.0    # 복제 플래시 (0~1)
+        self.trail     = []     # 이동 궤적
+
+    def color(self):
+        t = max(0.0, min(1.0, self.energy / ENERGY_MAX))
+        # 4색 보간
+        seg = t * (len(ENERGY_COLORS) - 1)
+        i   = int(seg)
+        f   = seg - i
+        if i >= len(ENERGY_COLORS) - 1:
+            return ENERGY_COLORS[-1]
+        c1, c2 = ENERGY_COLORS[i], ENERGY_COLORS[i+1]
+        return tuple(int(c1[k] + (c2[k]-c1[k])*f) for k in range(3))
+
+# ── GoL 스텝 ───────────────────────────────────────────────────────────────
+def gol_step(grid):
+    n = (np.roll(grid,  1, 0) + np.roll(grid, -1, 0) +
+         np.roll(grid,  1, 1) + np.roll(grid, -1, 1) +
+         np.roll(np.roll(grid,  1,0),  1,1) +
+         np.roll(np.roll(grid,  1,0), -1,1) +
+         np.roll(np.roll(grid, -1,0),  1,1) +
+         np.roll(np.roll(grid, -1,0), -1,1))
+    return (((grid==1)&((n==2)|(n==3)))|((grid==0)&(n==3))).astype(np.uint8)
+
+# ── 시뮬레이션 상태 ────────────────────────────────────────────────────────
+class Simulation:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        Organism._id_counter = 0
+        self.grid      = np.zeros((ROWS, COLS), dtype=np.uint8)
+        self.resources = np.zeros((ROWS, COLS), dtype=np.float32)  # 0~1
+        self.gen       = 0
+        self.organisms = []
+        self.spawn_events = []   # [(r,c,timer)] 복제 이펙트
+
+        # 자원 초기 배치
+        mask = np.random.rand(ROWS, COLS) < RESOURCE_DENSITY
+        self.resources[mask] = 1.0
+
+        # 초기 생명체 5마리
+        for _ in range(5):
+            self._spawn_organism(
+                random.randint(5, ROWS-10),
+                random.randint(5, COLS-10)
+            )
+
+    def _spawn_organism(self, r, c, direction=None, energy=None, generation=0):
+        if len(self.organisms) >= MAX_ORGANISMS:
+            return None
+        org = Organism(r, c, direction, energy, generation)
+        place_pattern(self.grid, r, c, GLIDERS[org.direction])
+        self.organisms.append(org)
+        return org
+
+    def step(self):
+        # 1) GoL 스텝
+        self.grid = gol_step(self.grid)
+        self.gen += 1
+
+        # 2) 자원 재생
+        regen_mask = np.random.rand(ROWS, COLS) < RESOURCE_REGEN
+        self.resources = np.clip(self.resources + regen_mask.astype(np.float32) * 0.5, 0, 1)
+
+        # 3) 자원 페이드 (자연 소멸 가속 — 방치된 자원이 쌓이지 않도록)
+        self.resources *= 0.993
+
+        new_orgs = []
+        dead_ids = set()
+
+        for org in self.organisms:
+            if not org.alive:
+                dead_ids.add(org.oid)
+                continue
+
+            org.age += 1
+            org.flash = max(0.0, org.flash - 0.08)
+
+            # ── 위치 추적: 무게중심 + 이전 위치 스무딩으로 튀는 현상 방지
+            raw_r, raw_c = bounding_box_center(self.grid, int(org.r), int(org.c))
+            # 이전 위치에서 너무 멀리 튀면 (간섭) 이전 위치 + 방향 드리프트로 대체
+            drift = {'SE':(0.25,0.25),'SW':(0.25,-0.25),'NE':(-0.25,0.25),'NW':(-0.25,-0.25)}
+            dr_r, dr_c = drift.get(org.direction, (0,0))
+            dist_jump = math.hypot(raw_r - org.r, raw_c - org.c)
+            if dist_jump > 6:
+                # 튀었다 → 누적 드리프트로 예측 위치 사용
+                cr = int((org.r + dr_r) % ROWS)
+                cc = int((org.c + dr_c) % COLS)
+            else:
+                cr, cc = raw_r, raw_c
+
+            org.trail.append((cr, cc))
+            if len(org.trail) > 16:
+                org.trail.pop(0)
+            org.r, org.c = float(cr), float(cc)
+
+            # ── 자원 흡수: 반경 5로 확대 + 궤적 경로도 청소
+            absorbed = 0
+            check_cells = set()
+            for dr in range(-5, 6):
+                for dc in range(-5, 6):
+                    check_cells.add(((cr+dr)%ROWS, (cc+dc)%COLS))
+            # 최근 궤적 주변도 포함
+            for tr, tc in org.trail[-4:]:
+                for dr in range(-2, 3):
+                    for dc in range(-2, 3):
+                        check_cells.add(((tr+dr)%ROWS, (tc+dc)%COLS))
+            for rr, cc2 in check_cells:
+                if self.resources[rr, cc2] > 0.4:
+                    self.resources[rr, cc2] = 0.0
+                    absorbed += 1
+            if absorbed:
+                # 흡수량에 로그 스케일 적용 — 한 번에 너무 많이 먹으면 수확 체감
+                gain = min(absorbed, 6) * ENERGY_PER_FOOD + max(0, absorbed-6) * 1
+                org.energy = min(ENERGY_MAX, org.energy + gain)
+
+            # ── 에너지 소모
+            org.energy -= ENERGY_DECAY
+
+            # ── 죽음 판정: alive 셀이 아예 없거나 에너지 완전 고갈
+            alive_nearby = int(self.grid[
+                max(0,cr-5):min(ROWS,cr+6),
+                max(0,cc-5):min(COLS,cc+6)
+            ].sum())
+
+            # Glider가 잠깐 간섭으로 사라져도 바로 죽이지 않고 2세대 유예
+            if alive_nearby == 0:
+                org._no_body = getattr(org, '_no_body', 0) + 1
+            else:
+                org._no_body = 0
+
+            if org.energy <= 0 or org._no_body >= 3:
+                org.alive = False
+                dead_ids.add(org.oid)
+                clear_pattern(self.grid, cr, cc, radius=4)
+                continue
+
+            # ── 복제
+            if org.energy >= REPLICATE_AT and len(self.organisms) + len(new_orgs) < MAX_ORGANISMS:
+                org.energy = ENERGY_START
+                org.flash  = 1.0
+                # 약간 떨어진 위치에 새 glider 생성
+                angle  = random.uniform(0, math.tau)
+                dist   = random.randint(8, 14)
+                nr     = int((cr + math.sin(angle)*dist) % ROWS)
+                nc     = int((cc + math.cos(angle)*dist) % COLS)
+                child_dir = random.choice(GLIDER_DIRS)
+                child = Organism(nr, nc, child_dir,
+                                  energy=ENERGY_START,
+                                  generation=org.generation+1)
+                place_pattern(self.grid, nr, nc, GLIDERS[child_dir])
+                new_orgs.append(child)
+                self.spawn_events.append([cr, cc, 1.0])
+
+        self.organisms = [o for o in self.organisms if o.oid not in dead_ids] + new_orgs
+
+        # spawn event 페이드
+        self.spawn_events = [[r,c,t-0.05] for r,c,t in self.spawn_events if t > 0]
+
+        # 생명체가 전멸하면 하나 자동 생성
+        if not self.organisms:
+            self._spawn_organism(
+                random.randint(5, ROWS-10),
+                random.randint(5, COLS-10)
+            )
+
+
+# ── 렌더러 ──────────────────────────────────────────────────────────────────
+def energy_color_dim(energy, alpha=0.4):
+    t   = max(0.0, min(1.0, energy / ENERGY_MAX))
+    seg = t * (len(ENERGY_COLORS)-1)
+    i   = int(seg); f = seg-i
+    if i >= len(ENERGY_COLORS)-1: c = ENERGY_COLORS[-1]
+    else:
+        c1,c2 = ENERGY_COLORS[i], ENERGY_COLORS[i+1]
+        c = tuple(int(c1[k]+(c2[k]-c1[k])*f) for k in range(3))
+    return tuple(int(v*alpha) for v in c)
+
+def draw_sim(surf, sim, font_m, font_s):
+    surf.fill(C_BG)
+
+    # ── 격자 배경 (희미한 선)
+    for r in range(0, ROWS, 8):
+        pygame.draw.line(surf, C_GRID, (0, r*CELL), (W, r*CELL))
+    for c in range(0, COLS, 8):
+        pygame.draw.line(surf, C_GRID, (c*CELL, 0), (c*CELL, H))
+
+    # ── 자원 렌더링
+    res_surface = pygame.Surface((W, H), pygame.SRCALPHA)
+    nz = np.argwhere(sim.resources > 0.1)
+    for r, c in nz:
+        v = float(sim.resources[r, c])
+        # 바이오루미네선트 펄스 효과
+        pulse = 0.7 + 0.3 * math.sin(sim.gen * 0.15 + r * 0.3 + c * 0.2)
+        alpha = int(v * pulse * 180)
+        glow_r = int(C_RESOURCE[0] * v)
+        glow_g = int(C_RESOURCE[1] * v * pulse)
+        glow_b = int(C_RESOURCE[2] * v)
+        # 글로우 (큰 원)
+        pygame.draw.circle(res_surface, (*C_RESOURCE[:2], int(alpha*0.3)),
+                           (c*CELL+CELL//2, r*CELL+CELL//2), CELL+2)
+        # 코어
+        pygame.draw.circle(res_surface, (glow_r, glow_g, glow_b, alpha),
+                           (c*CELL+CELL//2, r*CELL+CELL//2), CELL//2+1)
+    surf.blit(res_surface, (0,0))
+
+    # ── GoL 셀 렌더링 (생명체 색으로)
+    # 먼저 어느 셀이 어떤 생명체에 속하는지 맵 생성
+    org_map = {}  # (r,c) → organism
+    for org in sim.organisms:
+        cr, cc = int(org.r), int(org.c)
+        for dr in range(-5, 6):
+            for dc in range(-5, 6):
+                rr = (cr+dr)%ROWS
+                cc2= (cc+dc)%COLS
+                if sim.grid[rr, cc2]:
+                    org_map[(rr, cc2)] = org
+
+    alive_cells = np.argwhere(sim.grid)
+    cell_surf = pygame.Surface((W, H), pygame.SRCALPHA)
+    for r, c in alive_cells:
+        org = org_map.get((r, c))
+        if org:
+            base = org.color()
+            flash_add = int(org.flash * 120)
+            col = tuple(min(255, v + flash_add) for v in base)
+            alpha = 200 + int(org.flash * 55)
+        else:
+            col   = C_DEAD
+            alpha = 120
+        pygame.draw.rect(cell_surf, (*col, alpha),
+                         (c*CELL, r*CELL, CELL-1, CELL-1))
+    surf.blit(cell_surf, (0,0))
+
+    # ── 생명체 궤적 & 레이블
+    for org in sim.organisms:
+        col = org.color()
+        # 궤적
+        if len(org.trail) >= 2:
+            for i in range(1, len(org.trail)):
+                r1,c1 = org.trail[i-1]
+                r2,c2 = org.trail[i]
+                alpha = int(255 * (i / len(org.trail)) * 0.5)
+                pygame.draw.line(surf,
+                    tuple(int(v*0.5) for v in col),
+                    (c1*CELL+CELL//2, r1*CELL+CELL//2),
+                    (c2*CELL+CELL//2, r2*CELL+CELL//2), 1)
+        # 에너지 바
+        cr, cc = int(org.r), int(org.c)
+        bar_x = cc*CELL - 12
+        bar_y = cr*CELL - 18
+        bar_w = 26
+        bar_h = 4
+        ratio = org.energy / ENERGY_MAX
+        pygame.draw.rect(surf, (30,30,50),   (bar_x, bar_y, bar_w, bar_h))
+        pygame.draw.rect(surf, col,           (bar_x, bar_y, int(bar_w*ratio), bar_h))
+        pygame.draw.rect(surf, (80,80,100),  (bar_x, bar_y, bar_w, bar_h), 1)
+        # ID 레이블
+        lbl = font_s.render(f'#{org.oid} g{org.generation}', True,
+                             tuple(int(v*0.8) for v in col))
+        surf.blit(lbl, (bar_x, bar_y - 13))
+
+    # ── 복제 이펙트 (링 파동)
+    for r, c, t in sim.spawn_events:
+        radius = int((1.0 - t) * CELL * 10)
+        alpha  = int(t * 200)
+        if radius > 0:
+            pygame.draw.circle(surf, (*C_RESOURCE, alpha),
+                               (int(c*CELL+CELL//2), int(r*CELL+CELL//2)),
+                               radius, 2)
+
+    # ── HUD
+    _draw_hud(surf, sim, font_m, font_s)
+
+
+def _draw_hud(surf, sim, font_m, font_s):
+    # 반투명 패널
+    panel = pygame.Surface((260, 140), pygame.SRCALPHA)
+    panel.fill((4, 8, 18, 200))
+    pygame.draw.rect(panel, (*C_HUD_TEXT, 80), (0,0,260,140), 1, border_radius=6)
+    surf.blit(panel, (10, 10))
+
+    lines = [
+        (f"ORGANISM  LIFE",          font_m, C_RESOURCE),
+        (f"gen   {sim.gen:>6}",      font_s, C_HUD_TEXT),
+        (f"alive {len(sim.organisms):>6}",  font_s, C_HUD_TEXT),
+        (f"res   {int(sim.resources.sum()):>6}", font_s, C_HUD_TEXT),
+        (f"max   {MAX_ORGANISMS:>6}", font_s, C_HUD_DIM),
+    ]
+    y = 18
+    for text, font, col in lines:
+        s = font.render(text, True, col)
+        surf.blit(s, (20, y))
+        y += 22
+
+    # 에너지 범례
+    legend_x = W - 160
+    s = font_s.render('energy', True, C_HUD_DIM)
+    surf.blit(s, (legend_x, 12))
+    for i, col in enumerate(ENERGY_COLORS):
+        pygame.draw.rect(surf, col, (legend_x + i*28, 26, 24, 8), border_radius=2)
+    lo = font_s.render('low', True, ENERGY_COLORS[0])
+    hi = font_s.render('high', True, ENERGY_COLORS[-1])
+    surf.blit(lo, (legend_x, 38))
+    surf.blit(hi, (legend_x + 84, 38))
+
+    # 조작법
+    ctrl_lines = ['SPACE pause  S step  R reset',
+                  'click  add resource  +/- speed']
+    for i, t in enumerate(ctrl_lines):
+        s = font_s.render(t, True, C_HUD_DIM)
+        surf.blit(s, (10, H - 30 + i*14))
+
+
+# ── 메인 ───────────────────────────────────────────────────────────────────
+def main():
+    pygame.init()
+    screen = pygame.display.set_mode((W, H))
+    pygame.display.set_caption("Organism Life — GoL + Meta Layer")
+    clock  = pygame.time.Clock()
+
+    font_m = pygame.font.SysFont('monospace', 14, bold=True)
+    font_s = pygame.font.SysFont('monospace', 11)
+
+    sim     = Simulation()
+    running = False
+    speed   = 8    # gen/sec
+    acc     = 0.0
+
+    while True:
+        dt = clock.tick(FPS) / 1000.0
+
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_ESCAPE:
+                    pygame.quit(); sys.exit()
+                elif ev.key == pygame.K_SPACE:
+                    running = not running
+                elif ev.key == pygame.K_s:
+                    sim.step()
+                elif ev.key == pygame.K_r:
+                    sim.reset()
+                elif ev.key in (pygame.K_PLUS, pygame.K_EQUALS):
+                    speed = min(30, speed+2)
+                elif ev.key == pygame.K_MINUS:
+                    speed = max(1, speed-2)
+            if ev.type == pygame.MOUSEBUTTONDOWN:
+                mx, my = ev.pos
+                cr = my // CELL; cc = mx // CELL
+                # 클릭 주변에 자원 뿌리기
+                for dr in range(-3, 4):
+                    for dc in range(-3, 4):
+                        if random.random() < 0.5:
+                            rr = (cr+dr)%ROWS
+                            cc2= (cc+dc)%COLS
+                            sim.resources[rr, cc2] = 1.0
+
+        if running:
+            acc += dt * speed
+            while acc >= 1.0:
+                acc -= 1.0
+                sim.step()
+
+        draw_sim(screen, sim, font_m, font_s)
+        pygame.display.flip()
+
+
+if __name__ == '__main__':
+    main()
